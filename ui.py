@@ -3,7 +3,7 @@ import requests
 import json
 
 # ミニPCの管理APIベースURL
-API_BASE = "http://192.168.0.240:9000"
+API_BASE = "http://127.0.0.1:9000"
 
 FLAG_CHOICES = ["free", "sd", "pending", "ritu_use", "ritu_sleep"]
 
