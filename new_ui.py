@@ -188,16 +188,16 @@ def control_salad_app(machine_id: str, action: str):
 
 custom_css = """
 .card-box {
-    border: 1px solid #e5e7eb;
-    border-radius: 10px;
-    padding: 14px;
-    background: #ffffff;
+    border: 1px solid var(--border-color-primary) !important;
+    border-radius: 10px !important;
+    padding: 14px !important;
+    background: var(--block-background-fill) !important;
 }
 .summary-box {
-    border: 1px solid #e2e8f0;
-    border-radius: 10px;
-    padding: 12px 16px;
-    background: #f8fafc;
+    border: 1px solid var(--border-color-primary) !important;
+    border-radius: 10px !important;
+    padding: 12px 16px !important;
+    background: var(--background-fill-secondary) !important;
 }
 """
 
