@@ -299,6 +299,13 @@ with gr.Blocks(title="Node & GPU Controller", theme=gr.themes.Soft(), css=custom
                     with gr.Group(elem_classes=["card-box"]):
                         card_md = gr.Markdown(f"### 🎮 RTX {g}\n取得中...")
                         gpu_status_cards[g] = card_md
+    with gr.Row():
+        gr.Button(
+            "🥗 Salad Earn Summary (公式ダッシュボードを開く)",
+            link="https://salad.com/earn/summary",
+            variant="secondary",
+            size="sm",
+        )
 
     def refresh_ui():
         status_map, msg = fetch_system_status()
