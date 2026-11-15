@@ -1,9 +1,17 @@
 import os
+import time
+import urllib.parse
 import gradio as gr
 import requests
 
 # ミニPCの管理APIベースURL
 API_BASE = os.getenv("API_BASE", "http://192.168.0.240:9000")
+# ローカルスマートホームAPIのベースURL（同じ9000番なら変更不要、別ポートなら指定）
+SMARTHOME_API_BASE = os.getenv("SMARTHOME_API_BASE", "http://192.168.0.240:8000")
+
+# 電気代・為替レート設定（プラグ実測値からの損益分岐点計算用）
+ELECTRICITY_COST_JPY = 31.0  # 1kWhあたりの電気代 (円)
+USD_JPY_RATE = 155.0         # ドル円為替レート (円/$)
 
 FLAG_CHOICES = ["free", "ritu_sleep", "ritu_use", "salad", "sd", "pending"]
 
@@ -19,9 +27,61 @@ NODES = [
     {"id": "north",   "name": "North (メイン機)",         "gpus": ["5080"]},
 ]
 
+# SwitchBot プラグミニ (JP) のデバイスマッピング
+PLUG_DEVICES = {
+    "north":   {"id": "A0764E204AEE", "type": "plug"},
+    "torrent": {"id": "AC276E411EB2", "type": "plug"},
+    "terra":   {"id": "D83BDA1667F6", "type": "plug"},
+}
+
+# SwitchBot API レート制限対策用のメモリキャッシュ（120秒保持）
+_PLUG_CACHE = {"ts": 0.0, "data": {}}
+PLUG_CACHE_TTL = 120.0
+
+
+def fetch_all_plug_metrics() -> dict[str, dict]:
+    """全ノードのプラグ実測値(weight_w, voltage_v)を取得（TTL内はキャッシュを返す）"""
+    now = time.time()
+    if now - _PLUG_CACHE["ts"] < PLUG_CACHE_TTL and _PLUG_CACHE["data"]:
+        return _PLUG_CACHE["data"]
+
+    result = {}
+    for mid, cfg in PLUG_DEVICES.items():
+        dev_id = cfg["id"]
+        dev_type = urllib.parse.quote(cfg["type"], safe="")
+        url = f"{SMARTHOME_API_BASE}/api/switchbot/status/{dev_id}/{dev_type}"
+        try:
+            r = requests.get(url, timeout=2.5)
+            if r.status_code == 200:
+                d = r.json().get("data", {})
+                result[mid] = {
+                    "watt": float(d["weight_w"]) if d.get("weight_w") is not None else None,
+                    "volt": float(d["voltage_v"]) if d.get("voltage_v") is not None else None,
+                }
+            else:
+                result[mid] = _PLUG_CACHE["data"].get(mid, {"watt": None, "volt": None})
+        except Exception:
+            result[mid] = _PLUG_CACHE["data"].get(mid, {"watt": None, "volt": None})
+
+    _PLUG_CACHE["ts"] = now
+    _PLUG_CACHE["data"] = result
+    return result
+
+
+def calc_breakeven_usd_h(watt: float) -> float:
+    """消費電力(W)から1時間あたりの電気代($/h)を計算"""
+    return ((watt / 1000.0) * ELECTRICITY_COST_JPY) / USD_JPY_RATE
+
+
+def normalize_hourly_rate(raw_rate: float | None) -> float | None:
+    """gRPCから24時間予測レート($/24h)が返ってきている場合は24で割って時給($/h)に補正"""
+    if raw_rate is None:
+        return None
+    return (raw_rate / 24.0) if raw_rate > 0.8 else raw_rate
+
 
 def fetch_system_status():
-    """マシン・GPUフラグ・Salad/GPUメトリクスをAPIから一括取得"""
+    """マシン・GPUフラグ・Salad/GPUメトリクス・SwitchBotプラグ実測値を一括取得"""
     try:
         r_m = requests.get(f"{API_BASE}/api/machine/list", timeout=3)
         machines = r_m.json() if r_m.status_code == 200 else []
@@ -33,15 +93,20 @@ def fetch_system_status():
         salad_list = r_s.json() if r_s.status_code == 200 else []
         salad_map = {item["machine_id"]: item for item in salad_list}
 
+        plug_metrics = fetch_all_plug_metrics()
+
         status_map = {}
         for m in machines:
             mid = m["machine_id"]
             s_info = salad_map.get(mid, {})
+            p_info = plug_metrics.get(mid, {})
             status_map[mid] = {
                 "power": m.get("power", "unknown"),
                 "ip": m.get("ip_address", ""),
                 "gpus": {},
                 "salad": s_info.get("salad"),
+                "plug_w": p_info.get("watt"),
+                "plug_v": p_info.get("volt"),
             }
 
         for g in gpus:
@@ -61,21 +126,41 @@ def format_summary_boxes(status_map: dict) -> tuple[str, str, str, str]:
     total_net = 0.0
     balance = None
     last_24h = None
+    plug_count = 0
 
-    for m_data in status_map.values():
+    for mid, m_data in status_map.items():
         s = m_data.get("salad")
-        if s and m_data.get("power") == "on":
-            total_w += s.get("power", {}).get("total_estimated_w", 0.0)
+        plug_w = m_data.get("plug_w")
+        is_on = (m_data.get("power") == "on")
+
+        # 1. 消費電力の合算（プラグ実測値があれば優先、なければ推定値）
+        node_w = 0.0
+        if plug_w is not None:
+            node_w = plug_w
+            plug_count += 1
+        elif s and is_on:
+            node_w = s.get("power", {}).get("total_estimated_w", 0.0)
+        total_w += node_w
+
+        # 2. 時給レートと純利益の合算
+        if s and is_on:
             earn = s.get("earnings", {})
-            if earn.get("current_rate_usd_h") is not None:
-                total_rate += earn["current_rate_usd_h"]
-            if earn.get("net_profit_usd_h") is not None:
-                total_net += earn["net_profit_usd_h"]
+            hourly_rate = normalize_hourly_rate(earn.get("current_rate_usd_h"))
+            if hourly_rate is not None:
+                total_rate += hourly_rate
+                be = (
+                    calc_breakeven_usd_h(node_w)
+                    if plug_w is not None
+                    else s.get("power", {}).get("breakeven_usd_h", 0.0)
+                )
+                total_net += (hourly_rate - be)
+
             if earn.get("balance_usd") is not None and balance is None:
                 balance = earn["balance_usd"]
                 last_24h = earn.get("last_24h_usd", 0.0)
 
-    box_power = f"#### ⚡ 総消費電力 (推定)\n## {total_w:.1f} W"
+    pwr_label = "🔌 総消費電力 (プラグ実測)" if plug_count > 0 else "⚡ 総消費電力 (推定)"
+    box_power = f"#### {pwr_label}\n## {total_w:.1f} W"
     box_rate = f"#### 🥗 合計時給レート\n## ${total_rate:.4f} /h"
 
     net_icon = "🟢" if total_net >= 0 else "🔴"
@@ -93,6 +178,8 @@ def format_gpu_status_card(mid: str, gpu_name: str, m_data: dict) -> str:
     power = m_data.get("power", "unknown")
     flag = m_data.get("gpus", {}).get(gpu_name, "free")
     salad_data = m_data.get("salad")
+    plug_w = m_data.get("plug_w")
+    plug_v = m_data.get("plug_v")
 
     p_icon = "🟢 ON" if power == "on" else ("🔴 OFF" if power == "off" else "🟡 起動中")
     header = f"### 🎮 RTX {gpu_name} `[{mid}]`\n**電源:** {p_icon} ｜ **Flag:** `{flag.upper()}`\n\n---\n"
@@ -102,20 +189,26 @@ def format_gpu_status_card(mid: str, gpu_name: str, m_data: dict) -> str:
     if salad_data and power == "on":
         m = salad_data.get("target_gpu") if key == "target" else salad_data.get("isolated_gpus", {}).get(key)
 
+    plug_line = ""
+    if plug_w is not None and key == "target":
+        v_warn = "⚠️" if (plug_v is not None and plug_v < 95.0) else ""
+        v_str = f" ({v_warn}`{plug_v:.1f} V`)" if plug_v is not None else ""
+        plug_line = f"\n\n🔌 **PC実測:** `{plug_w:.1f} W`{v_str}"
+
     if m:
         w_val = m["power_w"]
         t_val = m["temp_c"]
         u_val = m["util_pct"]
-        # Gradio標準のテキストだけで見やすい10段階ゲージを表現
         filled = min(10, max(0, round(u_val / 10)))
         bar = "🟩" * filled + "⬜" * (10 - filled)
         metrics_md = (
             f"**使用率:** `{u_val}%` {bar}\n\n"
-            f"⚡ **電力:** `{w_val:.1f} W` ｜ 🌡️ **温度:** `{t_val} °C`\n\n---\n"
+            f"⚡ **GPU単体:** `{w_val:.1f} W` ｜ 🌡️ **温度:** `{t_val} °C`"
+            f"{plug_line}\n\n---\n"
         )
     else:
         reason = "マシン停止中 (OFF)" if power != "on" else "Agent未応答 / データなし"
-        metrics_md = f"**使用率:** `---`\n\n📡 *{reason}*\n\n---\n"
+        metrics_md = f"**使用率:** `---`\n\n📡 *{reason}*{plug_line}\n\n---\n"
 
     if key != "target":
         salad_md = "🔒 **Salad:** 隔離GPU (SD / Ollama専用)"
@@ -125,12 +218,17 @@ def format_gpu_status_card(mid: str, gpu_name: str, m_data: dict) -> str:
         s_state = salad_data.get("state", "UNKNOWN")
         earn = salad_data.get("earnings", {})
         pwr = salad_data.get("power", {})
-        rate = earn.get("current_rate_usd_h")
-        net = earn.get("net_profit_usd_h")
-        be = pwr.get("breakeven_usd_h", 0.0)
+        hourly_rate = normalize_hourly_rate(earn.get("current_rate_usd_h"))
+        be = calc_breakeven_usd_h(plug_w) if plug_w is not None else pwr.get("breakeven_usd_h", 0.0)
 
-        rate_str = f"${rate:.4f}/h" if rate is not None else "---"
-        net_str = f"{net:+.4f}/h" if net is not None else f"分岐 ${be:.3f}/h"
+        if hourly_rate is not None:
+            net_hourly = hourly_rate - be
+            rate_str = f"${hourly_rate:.4f}/h"
+            net_str = f"{net_hourly:+.4f}/h"
+        else:
+            rate_str = "---"
+            net_str = f"分岐 ${be:.3f}/h"
+
         salad_md = f"🥗 **Salad:** `{s_state}`\n\n💵 **時給:** `{rate_str}` (`{net_str}`)"
 
     return header + metrics_md + salad_md
@@ -211,7 +309,7 @@ with gr.Blocks(title="Node & GPU Controller", theme=gr.themes.Soft(), css=custom
     status_msg = gr.Markdown("待機中...")
 
     # =========================================================
-    # 1. 上段: ノード＆GPU 操作パネル（従来の3カラム操作盤）
+    # 1. 上段: ノード＆GPU 操作パネル
     # =========================================================
     ui_components = {}
     with gr.Row():
@@ -269,7 +367,7 @@ with gr.Blocks(title="Node & GPU Controller", theme=gr.themes.Soft(), css=custom
                     }
 
     # =========================================================
-    # 2. 下段: Gradio標準コンポーネントによるステータスモニター
+    # 2. 下段: ステータスモニター
     # =========================================================
     gr.Markdown("---")
     gr.Markdown("## 📊 Live Telemetry & Salad Earnings")
@@ -299,6 +397,7 @@ with gr.Blocks(title="Node & GPU Controller", theme=gr.themes.Soft(), css=custom
                     with gr.Group(elem_classes=["card-box"]):
                         card_md = gr.Markdown(f"### 🎮 RTX {g}\n取得中...")
                         gpu_status_cards[g] = card_md
+
     with gr.Row():
         gr.Button(
             "🥗 Salad Earn Summary (公式ダッシュボードを開く)",
@@ -311,16 +410,19 @@ with gr.Blocks(title="Node & GPU Controller", theme=gr.themes.Soft(), css=custom
         status_map, msg = fetch_system_status()
         updates = [msg]
 
-        # 1. 上段コントロールの更新値
         for node in NODES:
             mid = node["id"]
             m_data = status_map.get(mid, {})
             power = m_data.get("power", "unknown")
             salad_data = m_data.get("salad")
             g_map = m_data.get("gpus", {})
+            plug_w = m_data.get("plug_w")
+            plug_v = m_data.get("plug_v")
 
             p_icon = "🟢 ON" if power == "on" else ("🔴 OFF" if power == "off" else "🟡 移行中")
-            power_text = f"**電源:** {p_icon} (`{m_data.get('ip', 'N/A')}`)"
+            v_str = f" / `{plug_v:.1f}V`" if plug_v is not None else ""
+            plug_badge = f" ｜ 🔌 `{plug_w:.1f}W`{v_str}" if plug_w is not None else ""
+            power_text = f"**電源:** {p_icon} (`{m_data.get('ip', 'N/A')}`){plug_badge}"
             updates.append(power_text)
 
             for g in node["gpus"]:
@@ -329,11 +431,9 @@ with gr.Blocks(title="Node & GPU Controller", theme=gr.themes.Soft(), css=custom
             wd_enabled = salad_data.get("auto_stop_enabled", False) if salad_data else False
             updates.append(gr.update(value=wd_enabled))
 
-        # 2. 下段サマリー4ボックスの更新値
         b_pwr, b_rate, b_net, b_bal = format_summary_boxes(status_map)
         updates.extend([b_pwr, b_rate, b_net, b_bal])
 
-        # 3. 下段GPUカード4枚の更新値
         for node in NODES:
             mid = node["id"]
             m_data = status_map.get(mid, {})
@@ -342,7 +442,6 @@ with gr.Blocks(title="Node & GPU Controller", theme=gr.themes.Soft(), css=custom
 
         return updates
 
-    # 出力ターゲットの順序を refresh_ui の返り値と一致させる
     output_targets = [status_msg]
     for node in NODES:
         comp = ui_components[node["id"]]
